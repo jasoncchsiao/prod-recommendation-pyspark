@@ -161,5 +161,114 @@ class ProdRec(GetterSetter):
       inputDF.coalesce(1).write.mode(key_word) \
              .format('parquet').option('header','true').parquet(output_dir)
 
+  def getEci2CidDF(self, raw_pup: DataFrame, raw_eci: DataFrame) -> DataFrame:
+    resDF = raw_pup.join(raw_eci, on='eci', how='left') \
+                   .drop('eci') \
+                   .withColumnRenamed('cid','eci')
+    return resDF 
+
+  def getPreprocessDF(self, raw: DataFrame, level: str='eci') -> DataFrame:
+    windowSpec = Window.partitionBy('eci','sku').orderBy('primary_intensity_value')
+    preprocessDF = \
+    raw.select('eci','sku','primary_intensity_value') \
+       .na.drop(subset=['eci','sku']) \
+       .withColumn('primary_intensity_value', percent_rank().over(windowSpec)) \
+       .withColumn('primary_intensity_value', col('primary_intensity_value')+1e-6)
+    preprocessDF = preprocessDF.filter(col('primary_intensity_value').isNotNull())
+    self.prodRecHashMap['preprocessDF_ROW_COUNT'] = preprocessDF.count()
+    return preprocessDF
+
+  def getAccVolDF(self, df: DataFrame) -> DataFrame:
+    accDF = \
+    df.groupBy('eci','sku').sum('primary_intensity_value') \
+      .withColumnRenamed('sum(primary_intensity_value)','primary_intensity_value')
+    return accDF
+
+  def get_idxedDF(self, raw_df: DataFrame, col_name: str='idx') -> DataFrame:
+    schema = StructType([(StructField(col_name, IntegerType(), False))] + raw_df.schema.fields)
+    idxedDF = spark.createDataFrame(raw_df.rdd.zipWithIndex().map(lambda row: Row(**row[0].asDict(),
+                                                                                  idx=row[1])), schema)
+    return idxedDF 
+
+  def getTrainedDF(self, df: DataFrame, rawDF: DataFrame) -> DataFrame:
+    idxCltMap = self.get_idxedDF(df.select('eci').distinct())
+    idxProdMap = self.get_idxedDF(df.select('sku').distinct())
+    trainedDF = \
+    df.join(idxCltMap, on='eci', how='left').drop('eci').withColumnRenamed('idx','userId') \
+      .join(idxProdMap, on='sku', how='left').drop('sku').withColumnRenamed('idx','itemId') \
+      .withColumnRenamed('primary_intensity_value','rating') \
+      .select('userId','itemId','rating')
+    idxCltMap = idxCltMap.join(rawDF.select('eci').drop_duplicates(), on='eci', how='left') \
+                         .withColumn('idx','userId')
+    idxProdMap = idxProdMap.join(rawDF.select('sku','col2','col3','col4').drop_duplicates(),
+                                 on='sku', how='left') \
+                           .withColumn('idx','itemId')
+    return trainedDF, idxCltMap, idxProdMap
+
+  def getscaledDF(self, df: DataFrame, colname: str, strategy: str='minmax') -> DataFrame:
+    scaler = MinMaxScaler(inputCol=colname, outputCol='scaled_'+colname)
+    pass 
+
+  def als_train(self, df: DataFrame, best_rank: int, best_iter: int, best_regparam: float,
+                implicitPrefs: bool, is_grid_search: bool=False):
+    ratings = df 
+    (training, test) = ratings.randomSplit([1.0, 0.0], seed=0)
+    als = ALS(
+      rank=best_rank,
+      maxIter=best_iter,
+      regParam=best_regparam,
+      implicitPrefs=implicitPrefs,
+      userCol='userId',
+      itemCol='itemId',
+      ratingCol='rating',
+      coldStartStrategy='drop',
+      nonnegative=True,
+      seed=0
+    )
+    model = als.fit(training)
+    if is_grid_search:
+      hf = None
+    hf = model.userFactors 
+    return hf, model, ratings 
+
+  def model_evaluation(self, model, ratings):
+    (training, test) = ratings.randomSplit([0.8, 0.2], seed=0)
+    predictions = model.transform(test)
+    evaluator = RegressionEvaluator(metricName='rmse',
+                                    labelCol='rating',
+                                    predictionCol='prediction')
+    rmse = evaluator.evaluate(predictions)
+    return rmse 
+
+  def grid_search(self, df):
+    rank = [15]
+    maxIter = [5]
+    regParam = [0.001]
+    best_rmse = float('inf')
+    best_rank, best_iter, best_regparam = None, None, None 
+    for r in rank:
+      for m in maxIter:
+        for p in regParam:
+          _, model, ratings = self.als_train(df, r, m, p, True, True)
+          rmse = self.model_evaluation(model, ratings)
+          if rmse < best_rmse:
+            best_rmse = rmse 
+            best_rank = r 
+            best_iter = m
+            best_regparam = p 
+    return best_rank, best_iter, best_regparam, best_rmse
+
+  def getProdRec(self, prodRecDF: DataFrame, userMap: DataFrame, itemMap: DataFrame) -> DataFrame:
+    prodRecDF = prodRecDF.withColumn('recommendations', explode('recommendations'))
+    prodRecDF = prodRecDF.withColumn('itemId', self.getRecItem_udf('recommendations')) \
+                         .withColumn('rating', self.getRecRating_udf('recommendations')) \
+                         .drop('recommendations')
+    resDF = \
+    prodRecDF.join(userMap, on='userId', how='left') \
+             .join(itemMap, on='itemId', how='left')
+    return resDF 
+
+
+
 
     
